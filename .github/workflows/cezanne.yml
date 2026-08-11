@@ -69,6 +69,28 @@ jobs:
           tar -xf clang.tar.gz -C aosp-clang
           echo "${{ github.workspace }}/aosp-clang/bin" >> $GITHUB_PATH
 
+      - name: setup assembler wrapper (fix -EL for MGF 4.14 clang)
+        run: |
+          # MGF 4.14 Makefile forces -no-integrated-as and resolves GCC_TOOLCHAIN
+          # empty, so clang falls back to /usr/bin/as (x86) which rejects -EL.
+          # Route -EL/-EB (arm64) to aarch64-linux-gnu-as; keep host --64/--32.
+          if [ -f "${{ github.workspace }}/aosp-clang/bin/as" ]; then
+            mv "${{ github.workspace }}/aosp-clang/bin/as" "${{ github.workspace }}/aosp-clang/bin/as.real"
+          fi
+          cat > "${{ github.workspace }}/aosp-clang/bin/as" << 'EOF'
+          #!/bin/bash
+          # 智能汇编器路由：x86 host (--64/--32) → 系统 as；ARM64 → aarch64-linux-gnu-as
+          for arg in "$@"; do
+            case "$arg" in
+              --64|--32) exec /usr/bin/as "$@" ;;
+            esac
+          done
+          exec /usr/bin/aarch64-linux-gnu-as "$@"
+          EOF
+          chmod +x "${{ github.workspace }}/aosp-clang/bin/as"
+          echo "as wrapper: $(ls -la ${{ github.workspace }}/aosp-clang/bin/as)"
+          echo "target as: $(ls -la /usr/bin/aarch64-linux-gnu-as)"
+
       - name: 配置 ccache
         if: inputs.ccache_enabled
         run: |
