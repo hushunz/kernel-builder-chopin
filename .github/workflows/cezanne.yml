@@ -1,0 +1,171 @@
+name: Cezanne MT6889 4.14 内核构建
+
+env:
+  TZ: Asia/Shanghai
+
+  # ── 内核源码 ──
+  KERNEL_NAME: cezanne-bpf-a16
+  KERNEL_REPO: https://github.com/hushunz/xiaomi_mt6889_kernel
+  KERNEL_BRANCH: main
+  KERNEL_DEVICE: cezanne
+  DEFCONFIG_NAME: k6889v1_64_defconfig
+
+  # ── 构建参数 ──
+  ARCH: arm64
+  OUT_DIR: "${{ github.workspace }}/out"
+
+  # ── ccache ──
+  CCACHE_KEY: ccache-cezanne-4.14-a16
+
+on:
+  workflow_dispatch:
+    inputs:
+      ccache_enabled:
+        description: '是否启用 ccache 加速编译'
+        required: true
+        type: boolean
+        default: true
+
+      ccache_update:
+        description: '更新 ccache 缓存（更改编译配置或需要刷新缓存时开启）'
+        required: true
+        type: boolean
+        default: false
+
+      kernel_suffix:
+        description: '自定义内核后缀（留空使用默认，开头勿加连字符）'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    name: 构建内核
+    runs-on: ubuntu-22.04
+    steps:
+
+      - name: 初始化构建环境
+        id: setup_env
+        run: |
+          echo "builddate=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libssl-dev libfl-dev curl git ccache python2 python2-dev zip unzip
+
+      - name: 克隆内核源码
+        run: |
+          git clone --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} \
+            ${{ env.KERNEL_NAME }}
+
+      - name: 获取工具链 (AOSP Clang 12)
+        run: |
+          mkdir -p aosp-clang
+          CLANG_URL="https://github.com/seriaTvT/kernel-builder-chopin/releases/download/Toolchain/linux-x86-bd96dfe349c962681f0e5388af874c771ef96670-clang-r416183b.tar.gz"
+          for i in 1 2 3; do
+            wget -qO clang.tar.gz "$CLANG_URL" && break || { echo "下载失败，重试 $i/3..."; sleep 15; }
+          done
+          tar -xf clang.tar.gz -C aosp-clang
+          echo "${{ github.workspace }}/aosp-clang/bin" >> $GITHUB_PATH
+
+      - name: 配置 ccache
+        if: inputs.ccache_enabled
+        run: |
+          ccache -o compression=true -o cache_dir=$HOME/.ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: 载入 ccache 缓存
+        if: inputs.ccache_enabled && !inputs.ccache_update
+        uses: actions/cache/restore@v4
+        id: ccache_restore
+        with:
+          path: ~/.ccache
+          key: ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.ref_name }}-
+            ${{ env.CCACHE_KEY }}-${{ runner.os }}-
+            ${{ env.CCACHE_KEY }}-
+
+      - name: 生成 defconfig
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          if [[ "${{ inputs.ccache_enabled }}" == "true" ]]; then
+            CC_CMD="ccache clang"
+          else
+            CC_CMD="clang"
+          fi
+          if [[ -n "${{ inputs.kernel_suffix }}" ]]; then
+            export LOCALVERSION="-${{ inputs.kernel_suffix }}"
+          fi
+          make -j$(nproc) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=${{ env.ARCH }} \
+            CC="${CC_CMD}" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            READELF=llvm-readelf \
+            STRIP=llvm-strip \
+            OBJSIZE=llvm-size \
+            ${{ env.DEFCONFIG_NAME }}
+
+      - name: 编译内核 (Image.gz)
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          if [[ "${{ inputs.ccache_enabled }}" == "true" ]]; then
+            CC_CMD="ccache clang"
+            ccache -z
+          else
+            CC_CMD="clang"
+          fi
+          if [[ -n "${{ inputs.kernel_suffix }}" ]]; then
+            export LOCALVERSION="-${{ inputs.kernel_suffix }}"
+          fi
+          make -j$(nproc) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=${{ env.ARCH }} \
+            CC="${CC_CMD}" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            READELF=llvm-readelf \
+            STRIP=llvm-strip \
+            OBJSIZE=llvm-size \
+            Image.gz 2>&1 | tee build.log
+          if [ ! -f "${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz" ]; then
+            echo "::error::Image.gz 未生成，构建失败"
+            echo "===== 最近 60 行错误 ====="
+            grep -E "error:|fatal error|Error [0-9]|undefined reference|No such file" build.log | tail -60
+            exit 1
+          fi
+          ls -la "${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/"
+
+      - name: 输出 ccache 统计
+        if: inputs.ccache_enabled && always()
+        run: ccache -s
+
+      - name: 保存 ccache 缓存
+        if: inputs.ccache_enabled
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: 上传 Image.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-cezanne-a16
+          path: ${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz
+          if-no-files-found: error
+          retention-days: 14
