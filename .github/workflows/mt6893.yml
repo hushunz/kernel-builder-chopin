@@ -1,0 +1,105 @@
+name: mt6893-cezanne 基线验证
+
+env:
+  TZ: Asia/Shanghai
+
+  # ── 内核源码 ──
+  KERNEL_NAME: mt6893-cezanne
+  KERNEL_REPO: https://github.com/hushunz/kernel_xiaomi_mt6893_new
+  KERNEL_BRANCH: lineage-23.2
+  KERNEL_DEVICE: cezanne
+  DEFCONFIG_NAME: k6889v1_64_defconfig
+
+  # ── 构建参数 ──
+  ARCH: arm64
+  OUT_DIR: "${{ github.workspace }}/out"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_suffix:
+        description: '自定义内核后缀'
+        required: false
+        type: string
+        default: 'baseline'
+
+jobs:
+  build:
+    name: 验证 mt6893_new 基线编译
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 初始化构建环境
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libssl-dev libfl-dev curl git ccache python2 python2-dev zip unzip
+
+      - name: 克隆内核源码
+        run: |
+          git clone --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} \
+            ${{ env.KERNEL_NAME }}
+
+      - name: 获取工具链 (AOSP Clang 12)
+        run: |
+          mkdir -p aosp-clang
+          CLANG_URL="https://github.com/seriaTvT/kernel-builder-chopin/releases/download/Toolchain/linux-x86-bd96dfe349c962681f0e5388af874c771ef96670-clang-r416183b.tar.gz"
+          wget -qO clang.tar.gz "$CLANG_URL"
+          tar -xf clang.tar.gz -C aosp-clang
+          echo "${{ github.workspace }}/aosp-clang/bin" >> $GITHUB_PATH
+
+      - name: 生成 defconfig
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          make -j$(nproc) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=${{ env.ARCH }} \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ${{ env.DEFCONFIG_NAME }} 2>&1 | tee defconfig.log
+          echo "defconfig exit: $?"
+          tail -30 defconfig.log
+
+      - name: 编译内核 (Image.gz)
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          make -j$(nproc) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=${{ env.ARCH }} \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            Image.gz 2>&1 | tee build.log
+          if [ ! -f "${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz" ]; then
+            echo "::error::Image.gz 未生成，构建失败"
+            echo "===== 最近 60 行错误 ====="
+            grep -E "error:|fatal error|Error [0-9]|undefined reference|No such file" build.log | tail -60
+            exit 1
+          fi
+          ls -la "${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/"
+
+      - name: 上传 Image.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-mt6893-baseline
+          path: ${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz
+          if-no-files-found: error
+          retention-days: 14
